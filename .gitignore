@@ -1,0 +1,6 @@
+c-example/
+tests/
+*.bf
+*.out
+out.s
+smallbrain
