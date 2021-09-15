@@ -17,28 +17,19 @@ ENUM(OP_COPY)
 .global main
 
 .data
-zero_pattern:
-	.asciz "[-]"
-die_fmt:
-	.asciz "%s: %s\n"
-usage_fmt:
-	.asciz "Usage: %s script\n"
-func_open:
-	.asciz "open"
-func_fstat:
-	.asciz "fstat"
-func_read:
-	.asciz "read"
-func_malloc:
-	.asciz "malloc"
-memory:
-	.zero 30000
+zero_pattern:	.asciz "[-]"
+read_mode:	.asciz "r"
+die_fmt:	.asciz "%s: %s\n"
+usage_fmt:	.asciz "Usage: %s script\n"
+func_open:	.asciz "open"
+func_fstat:	.asciz "fstat"
+func_read:	.asciz "read"
+func_malloc:	.asciz "malloc"
+memory:		.zero 30000
 
 .bss
-bytecode:
-	.quad 0
-program:
-	.quad 0
+bytecode:	.quad 0
+program:	.quad 0
 
 .text
 # ==================
@@ -60,7 +51,7 @@ main:
 	movq	8(%rsi), %rdi # Move the specified script filename into %rdi
 	call	read_file     # Read the file
 	call	compile       # Compile into bytecode
-	#call	execute       # Execute the program
+	call	execute       # Execute the program
 
 	# Return successfully
 	xorl	%eax, %eax
@@ -102,6 +93,7 @@ read_file:
 	# Allocate a buffer for the programs contents
 	movq	-112(%rbp), %rdi # Put st_size (the filesize) in %rdi
 	incq	%rdi             # Make space for the NUL byte
+	pushq	%rdi             # Store the value of %rdi for the next 2 malloc calls
 	call	malloc           # Allocate the memory
 	testq	%rax, %rax       # Check if %rax is NULL
 	je	malloc_die       # If it is then malloc failed and we exit
@@ -110,27 +102,67 @@ read_file:
 	movb	$0, (%rax)       # NULL terminate the program
 
 	# Allocate a buffer for the bytecode
-	movq	-112(%rbp), %rdi # Put st_size (the filesize) in %rdi
-	incq	%rdi             # Make space for the NUL byte
+	popq	%rdi             # Retrieve %rdi from the stack
 	shlq	$4, %rdi         # Multiply the size of the buffer by 16 to make space for opcodes
 	call	malloc           # Allocate the memory
 	movq	%rax, (bytecode) # Store the address of the allocated memory in (bytecode)
 	testq	%rax, %rax       # Check if %rax is NULL
 	je	malloc_die       # If it is then malloc failed and we exit
 
-	# Read the program into the program buffer we allocated with read(2)
-	movq	-112(%rbp), %rdx # Set the buffersize
-	movq	(program), %rsi  # Set the buffer
-	movl	-4(%rbp), %edi   # Set the file descriptor
-	call	read
+	# Get a FILE* from the file descriptor with fdopen(3)
+	movl	-4(%rbp), %edi
+	movq	$read_mode, %rsi
+	call	fdopen
 
-	# Error check read(2) just like open(2)
-	cmpl	$-1, %eax
-	je	read_die
+	pushq	%rax            # Push the FILE* to the stack for the later call to fclose(3)
+	movq	(program), %r15 # Move the program buffer into %r15
+
+# cmpjeq - Compare Jump Equal Quadword
+# ====================================
+# Compare the value of 'val' to %rax and if they match jump to 'jump'.
+.macro cmpjeq val, jump
+	cmpq	\val, %rax
+	je	\jump
+.endm
+
+# cmpjeb - Compare Jump Equal Byte
+# ================================
+# Compare the value of 'val' to %al and if they match jump to 'jump'.
+.macro cmpjeb val, jump
+	cmpb	\val, %al
+	je	\jump
+.endm
+
+read_file_loop:
+	movq	-168(%rbp), %rdi # Move the FILE* into %rdi
+	call	fgetc            # Read a character from the file
+	cmpl	$EOF, %eax       # Check if we reached EOF
+	je	read_file_eof    # If we did then end the loop
+
+	# If we match any non-comment character jump to read_file_not_comment
+	cmpjeb	$'+', read_file_not_comment
+	cmpjeb	$'-', read_file_not_comment
+	cmpjeb	$'>', read_file_not_comment
+	cmpjeb	$'<', read_file_not_comment
+	cmpjeb	$'[', read_file_not_comment
+	cmpjeb	$']', read_file_not_comment
+	cmpjeb	$',', read_file_not_comment
+	cmpjeb	$'.', read_file_not_comment
+	# DEFAULT CASE (its a comment we can ignore)
+	jmp	read_file_loop
+
+read_file_not_comment:
+	movb	%al, (%r15)    # Read the character into the program buffer
+	incq	%r15           # Point to the next empty slot in the buffer
+	jmp	read_file_loop # Loop again
+
+read_file_eof:
+	# NUL terminate the buffer
+	movb	$0, (%r15)
 
 	# Close the file, don't error check this
-	movl	-4(%rbp), %eax
-	call	close
+	movq	-168(%rbp), %rdi
+	call	fclose
 
 	leave
 	ret
@@ -140,7 +172,6 @@ read_file:
 #	Compile the program into a bytecode which is an optimized version of the raw program. Each
 #	opcode is a "struct" where the higher 8 bytes are an opcode and the lower 8 are an option
 #	but of data.
-#
 # ==================
 compile:
 	movq	(program), %r15  # Store the address of the program pointer into %r15
@@ -150,28 +181,14 @@ compile_loop:
 	movq	(%r15), %rax
 
 	# Jump to a different label depending on which instruction we hit
-	cmpb	$'+', %al
-	je	compile_add
-	cmpb	$'-', %al
-	je	compile_sub
-	cmpb	$'>', %al
-	je	compile_right
-	cmpb	$'<', %al
-	je	compile_left
-	cmpb	$'[', %al
-	je	compile_loop_start
-	cmpb	$']', %al
-	je	compile_loop_end
-	cmpb	$',', %al
-	je	compile_read
-	cmpb	$'.', %al
-	je	compile_write
-
-	# COMMENTS GET HERE
-
-	incq	%r15        # Increment the instruction pointer
-	subq	$16, %r14   # Negate the effect of the later `addq`
-	jmp	compile_out
+	cmpjeb	$'+', compile_add
+	cmpjeb	$'-', compile_sub
+	cmpjeb	$'>', compile_right
+	cmpjeb	$'<', compile_left
+	cmpjeb	$'[', compile_loop_start
+	cmpjeb	$']', compile_loop_end
+	cmpjeb	$',', compile_read
+	cmpjeb	$'.', compile_write
 
 compile_add:
 	movq	$OP_ADD, (%r14) # Specify the ADD opcode
@@ -179,7 +196,7 @@ compile_add:
 compile_add_loop:
 	incq	%r15             # Move to the next instruction
 	cmpb	$'+', (%r15)     # Check if there is another +
-	jne	compile_out      # If not, check for a newline
+	jne	compile_out      # If not, exit this loop
 	incq	8(%r14)          # Increment the accumulator
 	jmp	compile_add_loop # Loop again
 
@@ -204,7 +221,7 @@ compile_right_loop:
 	jmp	compile_right_loop # Loop again
 
 compile_left:
-	movq	$OP_LEFT, (%r14) # Specify the RIGHT opcode
+	movq	$OP_LEFT, (%r14) # Specify the LEFT opcode
 	movq	$1, 8(%r14)      # Write the count of '<'s to the data portion
 compile_left_loop:
 	incq	%r15              # Move to the next instruction
@@ -218,10 +235,9 @@ compile_loop_start:
 	# pattern '[-]'. This pattern is one that sets a memory cell to 0, so we can optimize that.
 	movq	%r15, %rdi          # Compare the current position in the program string
 	movq	$zero_pattern, %rsi # Compare it against the zero pattern '[-]'
-	movl	$3, %edx            # We want to compare 3 bytes
-	call	strncmp             # Compare them with strncmp(3)
-	testl	%eax, %eax          # Check if the comparison returned 0
-	jz	compile_zero        # If it did, we matched the pattern
+	movl	$4, %ecx            # We want to compare 3 bytes (the instruction requires +1)
+	repe	cmpsb               # Keep looping CMPSB while bytes match
+	jrcxz	compile_zero        # Jump to compile_zero if the strings matched
 
 	movq	%r15, %rdi                # Move the current instruction pointer into %rdi
 	call	copy_loop_checker         # Call the copy loop checker
@@ -279,7 +295,7 @@ compile_backwards:
 	subq	$16, %r14
 
 	cmpq	$OP_LOOP_END, (%r14)   # Check if we hit a ']'
-	jne	compile_backwards_next # If we didn't move to the nex check
+	jne	compile_backwards_next # If we didn't move to the next check
 	pushq	%r14                   # Otherwise push the address of the opcode to the stack
 	jmp	compile_backwards_out
 
@@ -291,7 +307,9 @@ compile_backwards_next:
 compile_backwards_out:
 	cmpq	%r14, (bytecode)  # Check if we've seen every opcode
 	jne	compile_backwards # If not keep looping
-	ret                       # Otherwise return
+	movq	(program), %rdi   # Otherwise, move the program buffer to %rdi
+	call	free              # Free it
+	ret                       # And return
 
 # ==================
 # Description:
@@ -362,10 +380,7 @@ copy_loop_fail:
 
 # ==================
 # Description:
-#	Execute the brainfuck program. This is done the slow and naive way by just looping over
-#	command and executing it (although the '[-]' pattern does get optimized for that towers of
-#	hanoi speed!). I have written a *much* faster C version which compiles the brainfuck into a
-#	more optimized bytecode, but porting that to ASM was just too frustrating.
+#	Execute the brainfuck bytecode.
 # ==================
 execute:
 	movq	(bytecode), %r15 # Store the address of the program pointer into %r15
@@ -375,26 +390,17 @@ execute_loop:
 	movq	(%r15), %rax
 
 	# Jump to a different label depending on which instruction we hit
-	cmpq	$OP_ADD, %rax
-	je	execute_add
-	cmpq	$OP_SUB, %rax
-	je	execute_sub
-	cmpq	$OP_RIGHT, %rax
-	je	execute_right
-	cmpq	$OP_LEFT, %rax
-	je	execute_left
-	cmpq	$OP_LOOP_START, %rax
-	je	execute_loop_start
-	cmpq	$OP_LOOP_END, %rax
-	je	execute_loop_end
-	cmpq	$OP_READ, %rax
-	je	execute_read
-	cmpq	$OP_WRITE, %rax
-	je	execute_write
-	cmpq	$OP_ZERO, %rax
-	je	execute_zero
-	cmpq	$OP_COPY, %rax
-	je	execute_copy
+	cmpjeq	$OP_ADD, execute_add
+	cmpjeq	$OP_SUB, execute_sub
+	cmpjeq	$OP_RIGHT, execute_right
+	cmpjeq	$OP_LEFT, execute_left
+	cmpjeq	$OP_LOOP_START, execute_loop_start
+	cmpjeq	$OP_LOOP_END, execute_loop_end
+	cmpjeq	$OP_READ, execute_read
+	cmpjeq	$OP_WRITE, execute_write
+	cmpjeq	$OP_ZERO, execute_zero
+	# OP_COPY
+	jmp	execute_copy
 
 execute_add:
 	# Increment the current memory cell
@@ -409,27 +415,29 @@ execute_sub:
 	jmp	execute_out
 
 execute_right:
-	# Move the memory pointer right by 1
+	# Move the memory pointer right
 	addq	8(%r15), %r14
 	jmp	execute_out
 
 execute_left:
-	# Move the memory pointer left by 1
+	# Move the memory pointer left
 	subq	8(%r15), %r14
 	jmp	execute_out
 
 execute_loop_start:
+	# If the current memory cell is 0 move to the next '['
 	cmpb	$0, (%r14)
 	cmovzq	8(%r15), %r15
 	jmp	execute_out
 
 execute_loop_end:
-	# If the current memory cell is 0 move to the next command
+	# If the current memory cell is not 0 move to the next ']'
 	cmpb	$0, (%r14)
 	cmovnzq	8(%r15), %r15
 	jmp	execute_out
 
 execute_read:
+	# Set the current cell to the character read from stdin
 	call	getchar          # Read a character with getchar(3)
 	cmpb	$EOF, %al        # Check if the EOF was read
 	je	execute_read_eof # If EOF was read, jump to a special handler for that
@@ -442,17 +450,18 @@ execute_read_eof:
 	jmp	execute_out
 
 execute_write:
+	# Print the character at the current memory cell
 	movl	(%r14), %edi # Move the current memory cell into %edi
 	call	putchar      # Print it with putchar(3)
 	jmp	execute_out
 
 execute_zero:
-	# This is the one optimzation we actually do. If the string [-] is matched then just zero
-	# the current cell.
+	# Zero the current cell
 	movb	$0, (%r14)
 	jmp	execute_out
 
 execute_copy:
+	# Copy the current memory cells contents elsewhere
 	movq	8(%r15), %rax
 	movb	(%r14), %cl
 	movb	%cl, (%rax, %r14, 1)
@@ -472,25 +481,15 @@ execute_out:
 #	message to stderr and terminate the program.
 # ==================
 
-# Set the function name to "open" and call die
-open_die:
-	movq	$func_open, %rdi
+.macro fdie s
+	movq	\s, %rdi
 	jmp	die
+.endm
 
-# Same as open_die but for fstat(2)
-fstat_die:
-	movq	$func_fstat, %rdi
-	jmp	die
-
-# Same as open_die but for read(2)
-read_die:
-	movq	$func_read, %rdi
-	jmp	die
-
-# Same as open_die but for malloc(3)
-malloc_die:
-	movq	$func_malloc, %rdi
-	jmp	die
+open_die:	fdie	$func_open
+fstat_die:	fdie	$func_fstat
+read_die:	fdie	$func_read
+malloc_die:	fdie	$func_malloc
 
 
 # ==================
