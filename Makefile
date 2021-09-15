@@ -10,6 +10,6 @@ ${target}: ${target}.s
 
 .PHONY: bench clean
 bench:
-	hyperfine -S sh -w 200 -r 100000 "./smallbrain tests/towers-of-hanoi.bf"
+	hyperfine -S sh -w 20 -r 100 "./smallbrain tests/towers-of-hanoi.bf"
 clean:
 	rm -f ${target} out.s
