@@ -170,8 +170,8 @@ read_file_eof:
 # ==================
 # Description:
 #	Compile the program into a bytecode which is an optimized version of the raw program. Each
-#	opcode is a "struct" where the higher 8 bytes are an opcode and the lower 8 are an option
-#	but of data.
+#	opcode is a "struct" where the higher 8 bytes are an opcode and the lower 8 are data for
+#	the instruction.
 # ==================
 compile:
 	movq	(program), %r15  # Store the address of the program pointer into %r15
@@ -425,13 +425,13 @@ execute_left:
 	jmp	execute_out
 
 execute_loop_start:
-	# If the current memory cell is 0 move to the next '['
+	# If the current memory cell is 0 move to the next ']'
 	cmpb	$0, (%r14)
 	cmovzq	8(%r15), %r15
 	jmp	execute_out
 
 execute_loop_end:
-	# If the current memory cell is not 0 move to the next ']'
+	# If the current memory cell is not 0 move to the last '['
 	cmpb	$0, (%r14)
 	cmovnzq	8(%r15), %r15
 	jmp	execute_out
